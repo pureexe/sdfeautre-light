@@ -1,0 +1,1 @@
+DIR  = "/data2/pakkapon/datasets/polyhaven_exr"
