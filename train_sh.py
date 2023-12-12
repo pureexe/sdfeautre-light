@@ -27,17 +27,10 @@ def create_argparser():
     parser.add_argument("--batch_multiplier", type=int, default=1,help='multiple data in batch size to decease loading time')
     parser.add_argument('--cache_feature', action=argparse.BooleanOptionalAction)
     parser.add_argument('--model_type', type=str, default="covmixer", help="network type")
+    parser.add_argument('--loss_type', type=str, default="mse", help="loss_type")
 
     parser.add_argument("--epochs", type=int, default=1000,help='number of epoch')
     parser.add_argument("--per_scene", type=int, default=10, help='number of train image per scene')
-    parser.add_argument("--output_type", 
-        const="sh",
-        default="sh",
-        type=str,
-        nargs='?',
-        choices=['sh','envmap'],
-        help='how many sh level need'
-    )
     return parser
 
 class Feature2SHNetwork(L.LightningModule):
@@ -45,6 +38,7 @@ class Feature2SHNetwork(L.LightningModule):
         learning_rate=1e-3,
         coeff_level=6,
         model_type="covmixer",
+        loss_type="mse",
         **kwargs
     ):
         super().__init__()
@@ -55,36 +49,59 @@ class Feature2SHNetwork(L.LightningModule):
 
         self.save_hyperparameters()
         self.build_model()
+        self.is_envmap_model = self.hparams.model_type in ['unet']
         
     def build_model(self):
         if self.hparams.model_type == "covmixer":
             num_sh = (self.hparams.coeff_level+1)**2 * 3 # multiply by 3 for RGB
             self.model = ConvMixer(in_channel=2240, out_channel=num_sh, dim=512, depth=8)
-        elif self.hparams.model_type == "unet2d":
-            self.model = 
-
+        elif self.hparams.model_type == "unet":
+            print("=====================================")
+            print("Model type: Diffuser UNet")
+            print("=====================================")
+            self.model = diffusers.UNet2DModel(
+                in_channels=2240,
+                out_channels=3
+            )
         elif self.hparams.model_type == "simple_cnn":
             self.model = SimpleCNN(2240, modifier=2.0)
         else:
             raise NotImplementedError()
+
+    def loss(self, pred, gt):
+        if self.hparams.loss_type == "mse":
+            return torch.nn.functional.mse_loss(pred, gt)
+        elif self.hparams.loss_type == "l1":
+            return torch.nn.functional.l1_loss(pred, gt)
+        else:
+            raise NotImplementedError()
         
     def training_step(self, batch, batch_idx):
+        if self.is_envmap_model:
+            return self.train_step_envmap(batch, batch_idx)
+        else:
+            return self.train_step_sh(batch, batch_idx)
+    
+    def train_step_sh(self, batch, batch_idx):
         gt_sh = batch["sh"]
         pred_sh = self.model(batch["feature"])
-        loss = torch.nn.functional.mse_loss(pred_sh, gt_sh)
+        loss = self.loss(pred_sh, gt_sh)
         self.log("train_loss", loss)
         return loss
-    
-    def validation_step(self, batch, batch_idx):
 
-        if self.global_step == 0 and hasattr(self,'program_config'):
-            # write log of argparse
-            self.logger.experiment.add_text("program_config", str(self.program_config), self.global_step)
+    def train_step_envmap(self, batch, batch_idx):
+        gt = batch["env_ldr"]
+        pred = self.model(batch["feature"], timestep=0).sample 
+        pred = torchvision.transforms.functional.resize(pred, size=(128,256))
+        loss = self.loss(pred, gt)
+        self.log("train_loss", loss)
+        return loss
 
 
+    def validation_step_sh(self, batch, batch_idx):
         gt_sh = batch["sh"]
         pred_sh = self.model(batch["feature"])
-        loss = torch.nn.functional.mse_loss(pred_sh, gt_sh)
+        loss = self.loss(pred_sh, gt_sh)
 
         # plot validation loss
         self.log("val_loss", loss)
@@ -107,6 +124,47 @@ class Feature2SHNetwork(L.LightningModule):
             output_image = torch.from_numpy(output_image).permute(2,0,1)
             self.logger.experiment.add_image(f"{batch['name'][i]}", output_image, self.global_step)
 
+    
+    def validation_step_envmap(self, batch, batch_idx):
+        gt = batch["env_ldr"]
+        pred = self.model(batch["feature"], timestep=0).sample
+        pred = torchvision.transforms.functional.resize(pred, size=(128,256))
+        loss = self.loss(pred, gt)
+        self.log("val_loss", loss)
+
+        batch_size = gt.shape[0]
+        for i in range(batch_size):
+            # compute background
+            pred_i = pred[i].detach().cpu()
+            gt_i = gt[i].detach().cpu()
+
+            pred_i = torch.clamp((pred_i + 1.0) / 2.0, 0.0, 1.0)
+            gt_i = torch.clamp((gt_i + 1.0) / 2.0, 0.0, 1.0)
+
+            input_image = batch["image"][i].detach().cpu()
+            input_image = torch.clamp((input_image + 1.0) / 2.0, 0.0, 1.0)
+
+            
+            psnr = skimage.metrics.peak_signal_noise_ratio(gt_i.permute(1,2,0).numpy(), pred_i.permute(1,2,0).numpy())
+            self.log("val_psnr/{}".format(batch["name"][i]), psnr)
+            
+            output_image = torch.cat([input_image, gt_i, pred_i], axis=-1)
+            self.logger.experiment.add_image(f"{batch['name'][i]}", output_image, self.global_step)
+
+
+
+    def validation_step(self, batch, batch_idx):
+
+        if self.global_step == 0 and hasattr(self,'program_config'):
+            # write log of argparse
+            self.logger.experiment.add_text("program_config", str(self.program_config), self.global_step)
+
+        if self.is_envmap_model:
+            return self.validation_step_envmap(batch, batch_idx)
+        else:
+            return self.validation_step_sh(batch, batch_idx)
+        
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         return optimizer
@@ -123,7 +181,8 @@ class Feature2SHDataset(torch.utils.data.Dataset):
                  per_scene=0, # 0 mean auto
                  batch_multiplier=1,
                  is_cache_feature=False,
-                 sh_dir="pysh_100"
+                 sh_dir="pysh_100",
+                 model_type="convmixer"
                  ):
         super().__init__()
         self.root = root
@@ -137,6 +196,7 @@ class Feature2SHDataset(torch.utils.data.Dataset):
         self.split = split
         self.batch_multiplier = batch_multiplier
         self.is_cache_feature = is_cache_feature
+        self.is_envmap_model = model_type in ['unet']
         if is_cache_feature:
             self.cache_features = {}
         if per_scene == 0:
@@ -176,27 +236,37 @@ class Feature2SHDataset(torch.utils.data.Dataset):
             feature = self.aggragate_feature(features)
             if self.is_cache_feature:
                 self.cache_features[filename] = feature
-        
-        # read sh
-        npy_path = os.path.join(self.root, self.sh_dir, self.light_type, f"{filename}.npy")
-        sh_full = np.load(npy_path)
-        sh_coeff = flatten_sh_coeff(sh_full, self.lmax)
-        sh_coeff = torch.from_numpy(sh_coeff).to(dtype=torch.float32).view(-1)
-        
+
         ret_dict = {
             "name": self.files[file_index],
             "feature": feature,
-            "sh": sh_coeff
         }
-        
-        if self.split.startswith("val"):
-            # load with PIL
-            ret_dict["image"] = Image.open(os.path.join(self.root, "rectangle", "ldr", f"{filename}.png")).convert("RGB").resize((256,256))
-            ret_dict["env_ldr"] = Image.open(os.path.join(self.root, "envmap", "ldr", f"{filename}.png")).convert("RGB").resize((512,256))
-            # conver to tensor
-            ret_dict["image"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["image"]) / 255.0
-            ret_dict["env_ldr"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["env_ldr"]) / 255.0
-                        
+       
+        # read sh
+        if self.is_envmap_model:
+            ret_dict['env_ldr'] = Image.open(os.path.join(self.root, "envmap", "ldr", f"{filename}.png")).convert("RGB").resize((256,128))
+            ret_dict["env_ldr"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["env_ldr"])
+            ret_dict["env_ldr"] = ret_dict["env_ldr"] / 255.0
+            ret_dict["env_ldr"] = (ret_dict["env_ldr"] *2.0) - 1.0
+            if self.split.startswith("val"):
+                ret_dict["image"] = Image.open(os.path.join(self.root, "rectangle", "ldr", f"{filename}.png")).convert("RGB").resize((128,128))
+                ret_dict["image"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["image"])
+                ret_dict["image"] = ret_dict["image"] / 255.0
+                ret_dict["image"] = (ret_dict["image"] *2.0) - 1.0
+        else:
+            npy_path = os.path.join(self.root, self.sh_dir, self.light_type, f"{filename}.npy")
+            sh_full = np.load(npy_path)
+            sh_coeff = flatten_sh_coeff(sh_full, self.lmax)
+            sh_coeff = torch.from_numpy(sh_coeff).to(dtype=torch.float32).view(-1)
+            ret_dict['sh'] = sh_coeff
+            if self.split.startswith("val"):
+                # load with PIL
+                ret_dict["image"] = Image.open(os.path.join(self.root, "rectangle", "ldr", f"{filename}.png")).convert("RGB").resize((256,256))
+                ret_dict["env_ldr"] = Image.open(os.path.join(self.root, "envmap", "ldr", f"{filename}.png")).convert("RGB").resize((512,256))
+                # conver to tensor
+                ret_dict["image"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["image"]) / 255.0
+                ret_dict["env_ldr"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["env_ldr"]) / 255.0
+
         return ret_dict
     
     def __len__(self) -> int:
@@ -208,6 +278,7 @@ def main():
         learning_rate = args.learning_rate,
         coeff_level = args.coeff_level,
         model_type = args.model_type,
+        loss_type = args.loss_type,
         program_config = args
     )
    
@@ -220,14 +291,16 @@ def main():
         per_scene=args.per_scene,
         batch_multiplier=args.batch_multiplier,
         is_cache_feature=args.cache_feature,
-        feature_step=900
+        feature_step=900,
+        model_type=args.model_type
     )
     val_dataset = Feature2SHDataset(
         root=args.dataset,
         split="val"+args.split_type,
         light_type="ldr",
         lmax=args.coeff_level,
-        feature_step=900
+        feature_step=900,
+        model_type=args.model_type
     )
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, num_workers=int(os.cpu_count()/2))
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, num_workers=16)
