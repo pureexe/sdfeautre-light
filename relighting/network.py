@@ -35,7 +35,7 @@ def linear(c_in, c_out):
     )
 
 class SimpleCNN(nn.Module):
-    def __init__(self, input_channel=2240, modifier=1.0):
+    def __init__(self, input_channel=2240, output_channel=147, modifier=1.0):
         super(SimpleCNN, self).__init__()
         self.modifier = modifier
         initial_conv_channel = int(256 * modifier)
@@ -51,7 +51,7 @@ class SimpleCNN(nn.Module):
         self.mlp = nn.Sequential(
             *[linear(initial_mlp_channel // 2**i, initial_mlp_channel // 2**(i+1)) for i in range(3)]
         )
-        self.head = nn.Linear(head_channel, 108)
+        self.head = nn.Linear(head_channel, output_channel)
 
     def forward(self, x):
         x = self.conv_in(x)

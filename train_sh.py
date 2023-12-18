@@ -19,7 +19,7 @@ L_MAX = 6
 
 def create_argparser():    
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="/data2/pakkapon/relight/sdfeautre-light/data/polyhaven" ,help='dataset path')
+    parser.add_argument("--dataset", type=str, default="/home/pakkapon/mnt_tl_vision17/data2/pakkapon/relight/sdfeautre-light/data/polyhaven" ,help='dataset path')
     parser.add_argument("--gpus", type=int, default=1 ,help='num gpu')
     parser.add_argument("--coeff_level", type=int, default=6 ,help='how many sh level need')
     parser.add_argument("--split_type", type=str, default="" ,help='select split file')
@@ -32,6 +32,8 @@ def create_argparser():
 
     parser.add_argument("--epochs", type=int, default=1000,help='number of epoch')
     parser.add_argument("--per_scene", type=int, default=10, help='number of train image per scene')
+    parser.add_argument("--batch_size", type=int, default=4, help='number of batch size')
+    parser.add_argument('--note', type=str, default="", help="loss_type")
     return parser
 
 class Feature2SHNetwork(L.LightningModule):
@@ -66,7 +68,8 @@ class Feature2SHNetwork(L.LightningModule):
                 out_channels=3
             )
         elif self.hparams.model_type == "simple_cnn":
-            self.model = SimpleCNN(2240, modifier=2.0)
+            num_sh = (self.hparams.coeff_level+1)**2 * 3 # multiply by 3 for RGB
+            self.model = SimpleCNN(2240, num_sh, modifier=2.0)
         else:
             raise NotImplementedError()
 
@@ -88,6 +91,7 @@ class Feature2SHNetwork(L.LightningModule):
         gt_sh = batch["sh"]
         pred_sh = self.model(batch["feature"])
         loss = self.loss(pred_sh, gt_sh)
+        #loss = self.loss(pred_sh[:,0], gt_sh[:,0])
         self.log("train_loss", loss)
         return loss
 
@@ -102,9 +106,11 @@ class Feature2SHNetwork(L.LightningModule):
 
 
     def validation_step_sh(self, batch, batch_idx):
-        gt_sh = batch["sh"]
+        gt_sh = batch["sh"] #[1,147]
         pred_sh = self.model(batch["feature"])
         loss = self.loss(pred_sh, gt_sh)
+        #loss = self.loss(pred_sh[:,0], gt_sh[:,0])
+        #print(pred_sh[0,0], gt_sh[0,0], torch.abs(pred_sh[0,0] - gt_sh[0,0]))
 
         # plot validation loss
         self.log("val_loss", loss)
@@ -326,8 +332,8 @@ def main():
         model_type=args.model_type,
         input_type=args.input_type
     )
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, num_workers=4)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, num_workers=4)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=8)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, num_workers=8)
 
     trainer = L.Trainer(
         accelerator="gpu", 
