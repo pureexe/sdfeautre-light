@@ -11,6 +11,7 @@ import numpy as np
 from relighting.sh_utils import flatten_sh_coeff, compute_background
 from relighting.network import SimpleCNN, ConvMixer
 import diffusers
+from diffusers import AutoencoderKL
 
 #torch.multiprocessing.set_start_method('spawn')
 
@@ -27,7 +28,7 @@ def create_argparser():
     parser.add_argument("--batch_multiplier", type=int, default=1,help='multiple data in batch size to decease loading time')
     parser.add_argument('--cache_feature', action=argparse.BooleanOptionalAction)
     parser.add_argument('--model_type', type=str, default="covmixer", help="network type")
-    parser.add_argument('--input_type', type=str, default="envmap", help="Input type (envmap, chromeball)")
+    parser.add_argument('--input_type', type=str, default="chromeball", help="Input type (envmap, chromeball)")
     parser.add_argument('--loss_type', type=str, default="mse", help="loss_type")
 
     parser.add_argument("--epochs", type=int, default=1000,help='number of epoch')
@@ -35,6 +36,8 @@ def create_argparser():
     parser.add_argument("--batch_size", type=int, default=4, help='number of batch size')
     parser.add_argument('--note', type=str, default="", help="loss_type")
     return parser
+
+
 
 class Feature2SHNetwork(L.LightningModule):
     def __init__(self, 
@@ -63,15 +66,31 @@ class Feature2SHNetwork(L.LightningModule):
             print("=====================================")
             print("Model type: Diffuser UNet")
             print("=====================================")
+            unet_out = 4 if self.hparams.input_type == "chromeball" else 3
             self.model = diffusers.UNet2DModel(
                 in_channels=2240,
-                out_channels=3
+                out_channels=unet_out,
+                block_out_channels=[64, 128, 192, 256],
             )
+            self.vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix")
+            # disable VAE gradient
+            for p in self.vae.parameters():
+                p.requires_grad=False
+
+
         elif self.hparams.model_type == "simple_cnn":
             num_sh = (self.hparams.coeff_level+1)**2 * 3 # multiply by 3 for RGB
             self.model = SimpleCNN(2240, num_sh, modifier=2.0)
         else:
             raise NotImplementedError()
+        
+    def decode_latents(self, latents):
+        latents = 1 / self.vae.config.scaling_factor * latents
+        image = self.vae.decode(latents, return_dict=False)[0]
+        image = (image / 2 + 0.5).clamp(0, 1) #[1,3,1024,1024]
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
+        image = image.float()
+        return image
 
     def loss(self, pred, gt):
         if self.hparams.loss_type == "mse":
@@ -100,6 +119,8 @@ class Feature2SHNetwork(L.LightningModule):
         pred = self.model(batch["feature"], timestep=0).sample 
         if self.hparams.input_type == "envmap":
             pred = torchvision.transforms.functional.resize(pred, size=(128,256))
+        elif self.hparams.input_type == "chromeball":
+            pred = self.decode_latents(pred)
         loss = self.loss(pred, gt)
         self.log("train_loss", loss)
         return loss
@@ -148,6 +169,8 @@ class Feature2SHNetwork(L.LightningModule):
         pred = self.model(batch["feature"], timestep=0).sample
         if self.hparams.input_type == "envmap":
             pred = torchvision.transforms.functional.resize(pred, size=(128,256))
+        elif self.hparams.input_type == "chromeball":
+            pred = self.decode_latents(pred)
         loss = self.loss(pred, gt)
         self.log("val_loss", loss)
 
@@ -156,12 +179,16 @@ class Feature2SHNetwork(L.LightningModule):
             # compute background
             pred_i = pred[i].detach().cpu()
             gt_i = gt[i].detach().cpu()
-
-            pred_i = torch.clamp((pred_i + 1.0) / 2.0, 0.0, 1.0)
-            gt_i = torch.clamp((gt_i + 1.0) / 2.0, 0.0, 1.0)
-
             input_image = batch["image"][i].detach().cpu()
-            input_image = torch.clamp((input_image + 1.0) / 2.0, 0.0, 1.0)
+
+            if self.hparams.input_type == "envmap":
+                pred_i = (pred_i + 1.0) / 2.0
+                gt_i = (gt_i + 1.0) / 2.0
+                input_image = (input_image + 1.0) / 2.0
+
+                pred_i = torch.clamp(pred_i, 0.0, 1.0)
+                gt_i = torch.clamp(gt_i, 0.0, 1.0)
+                input_image = torch.clamp(input_image, 0.0, 1.0)
 
             
             psnr = skimage.metrics.peak_signal_noise_ratio(gt_i.permute(1,2,0).numpy(), pred_i.permute(1,2,0).numpy())
@@ -271,15 +298,20 @@ class Feature2SHDataset(torch.utils.data.Dataset):
                 ret_dict["gt"] = ret_dict["gt"] / 255.0
                 ret_dict["gt"] = (ret_dict["gt"] *2.0) - 1.0
             elif self.input_type == "chromeball":
-                ret_dict["gt"] = Image.open(os.path.join(self.root, "ball_withbg", "ldr", f"{filename}.png")).convert("RGB").resize((128,128))
+                ret_dict["gt"] = Image.open(os.path.join(self.root, "ball_withbg", "ldr", f"{filename}.png")).convert("RGB").resize((1024,1024))
                 ret_dict["gt"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["gt"])
                 ret_dict["gt"] = ret_dict["gt"] / 255.0
-                ret_dict["gt"] = (ret_dict["gt"] *2.0) - 1.0
+                #ret_dict["gt"] = (ret_dict["gt"] *2.0) - 1.0 (VAE is now using 0-1)
             if self.split.startswith("val"):
-                ret_dict["image"] = Image.open(os.path.join(self.root, "rectangle", "ldr", f"{filename}.png")).convert("RGB").resize((128,128))
+                ret_dict["image"] = Image.open(os.path.join(self.root, "rectangle", "ldr", f"{filename}.png")).convert("RGB")
+                if self.input_type == "chromeball":
+                    ret_dict["image"] = ret_dict["image"].resize((1024, 1024))
+                else:
+                    ret_dict["image"] = ret_dict["image"].resize((128,128))
                 ret_dict["image"] = torchvision.transforms.functional.pil_to_tensor(ret_dict["image"])
                 ret_dict["image"] = ret_dict["image"] / 255.0
-                ret_dict["image"] = (ret_dict["image"] *2.0) - 1.0
+                if self.input_type != "chromeball":
+                    ret_dict["image"] = (ret_dict["image"] *2.0) - 1.0
         else:
             npy_path = os.path.join(self.root, self.sh_dir, self.light_type, f"{filename}.npy")
             sh_full = np.load(npy_path)
@@ -335,10 +367,15 @@ def main():
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=8)
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, num_workers=8)
 
+    precision = 32 
+    if args.model_type == "unet" and args.input_type == "chromeball":
+        precision = 16
+
     trainer = L.Trainer(
         accelerator="gpu", 
         devices=args.gpus,
         max_epochs=args.epochs,
+        precision=precision
     )
     
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
