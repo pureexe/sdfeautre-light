@@ -2,6 +2,7 @@ import os
 import argparse
 from typing import Any
 from lightning.pytorch.utilities.types import STEP_OUTPUT 
+from lightning.pytorch.loggers import TensorBoardLogger
 import torch
 import torchvision
 import lightning as L 
@@ -12,6 +13,7 @@ from relighting.sh_utils import flatten_sh_coeff, compute_background
 from relighting.network import SimpleCNN, ConvMixer
 import diffusers
 from diffusers import AutoencoderKL
+from lightning.pytorch import seed_everything
 
 #torch.multiprocessing.set_start_method('spawn')
 
@@ -20,6 +22,7 @@ L_MAX = 6
 
 def create_argparser():    
     parser = argparse.ArgumentParser()
+    parser.add_argument('--name', type=str, default="", help="experiment name")
     parser.add_argument("--dataset", type=str, default="/home/pakkapon/mnt_tl_vision17/data2/pakkapon/relight/sdfeautre-light/data/polyhaven" ,help='dataset path')
     parser.add_argument("--gpus", type=int, default=1 ,help='num gpu')
     parser.add_argument("--coeff_level", type=int, default=6 ,help='how many sh level need')
@@ -27,14 +30,22 @@ def create_argparser():
     parser.add_argument("--learning_rate", type=float, default=1e-4 ,help='learning_rate')
     parser.add_argument("--batch_multiplier", type=int, default=1,help='multiple data in batch size to decease loading time')
     parser.add_argument('--cache_feature', action=argparse.BooleanOptionalAction)
-    parser.add_argument('--model_type', type=str, default="covmixer", help="network type")
-    parser.add_argument('--input_type', type=str, default="chromeball", help="Input type (envmap, chromeball)")
-    parser.add_argument('--loss_type', type=str, default="mse", help="loss_type")
+    parser.add_argument('--no_batchnorm', dest='has_batchnorm', action='store_false', help='use a model without batchnorm')
+    parser.set_defaults(has_batchnorm=True)
+    parser.add_argument('--no_batchnorm_track', dest='use_batchnorm_track', action='store_false', help='disable stat track for batch norm')
+    parser.set_defaults(use_batchnorm_track=True)
+    parser.add_argument("--batchnorm_momentum", type=float, default=0.1 ,help='batchnorm_momentum')
 
+
+    parser.add_argument('--model_type', type=str, default="covmixer", help="network type")
+    parser.add_argument('--input_type', type=str, default="envmap", help="Input type (envmap, chromeball)")
+    parser.add_argument('--loss_type', type=str, default="mse", help="loss_type")
+    parser.add_argument('--convmix_depth', type=int, default=8, help="convmix depth")
+    
     parser.add_argument("--epochs", type=int, default=1000,help='number of epoch')
     parser.add_argument("--per_scene", type=int, default=10, help='number of train image per scene')
     parser.add_argument("--batch_size", type=int, default=4, help='number of batch size')
-    parser.add_argument('--note', type=str, default="", help="loss_type")
+    parser.add_argument('--note', type=str, default="", help="note")
     return parser
 
 
@@ -46,11 +57,14 @@ class Feature2SHNetwork(L.LightningModule):
         model_type="covmixer",
         loss_type="mse",
         input_type="envmap",
+        convmix_depth=8,
+        has_batchnorm=True,
+        batchnorm_momentum=0.1,
+        use_batchnorm_track=True,
         **kwargs
     ):
         super().__init__()
         self.model = None
-
         if "program_config" in kwargs:
             self.program_config = kwargs['program_config']
 
@@ -61,7 +75,15 @@ class Feature2SHNetwork(L.LightningModule):
     def build_model(self):
         if self.hparams.model_type == "covmixer":
             num_sh = (self.hparams.coeff_level+1)**2 * 3 # multiply by 3 for RGB
-            self.model = ConvMixer(in_channel=2240, out_channel=num_sh, dim=512, depth=8)
+            self.model = ConvMixer(
+                in_channel=2240, 
+                out_channel=num_sh, 
+                dim=512, 
+                depth=self.hparams.convmix_depth, 
+                has_batchnorm=self.hparams.has_batchnorm,
+                batchnorm_momentum=self.hparams.batchnorm_momentum,
+                use_batchnorm_track=self.hparams.use_batchnorm_track
+            )
         elif self.hparams.model_type == "unet":
             print("=====================================")
             print("Model type: Diffuser UNet")
@@ -108,6 +130,7 @@ class Feature2SHNetwork(L.LightningModule):
     
     def train_step_sh(self, batch, batch_idx):
         gt_sh = batch["sh"]
+        
         pred_sh = self.model(batch["feature"])
         loss = self.loss(pred_sh, gt_sh)
         #loss = self.loss(pred_sh[:,0], gt_sh[:,0])
@@ -332,6 +355,7 @@ class Feature2SHDataset(torch.utils.data.Dataset):
         return len(self.files) * self.batch_multiplier
 
 def main():
+    seed_everything(42)
     args = create_argparser().parse_args()
     model = Feature2SHNetwork(
         learning_rate = args.learning_rate,
@@ -339,6 +363,10 @@ def main():
         model_type = args.model_type,
         loss_type = args.loss_type,
         input_type = args.input_type,
+        convmix_depth = args.convmix_depth,
+        has_batchnorm = args.has_batchnorm,
+        batchnorm_momentum = args.batchnorm_momentum,
+        use_batchnorm_track = args.use_batchnorm_track,
         program_config = args
     )
    
@@ -364,18 +392,24 @@ def main():
         model_type=args.model_type,
         input_type=args.input_type
     )
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=8)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, num_workers=8)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=4)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, num_workers=4)
 
     precision = 32 
     if args.model_type == "unet" and args.input_type == "chromeball":
         precision = 16
 
+    save_dir = os.path.join("lightning_logs", args.name) if args.name != "" else os.getcwd() 
+    logger = TensorBoardLogger(
+        save_dir=save_dir,
+    )
     trainer = L.Trainer(
+        logger = logger,
         accelerator="gpu", 
         devices=args.gpus,
         max_epochs=args.epochs,
-        precision=precision
+        precision=precision,
+        log_every_n_steps=1
     )
     
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)

@@ -30,7 +30,7 @@ def block(c_in, c_out, p=0):
 def linear(c_in, c_out):
     return nn.Sequential(
         nn.Linear(c_in, c_out),
-        # nn.BatchNorm1d(c_out),
+        # nn.BatchNorm1d(c_out), # already comment
         nn.GELU(),
     )
 
@@ -102,7 +102,38 @@ class Residual(nn.Module):
     def forward(self, x):
         return self.fn(x) + x
 
-def ConvMixer(in_channel, out_channel, dim, depth, kernel_size=9, patch_size=7):
+def ConvMixer(in_channel, out_channel, dim, depth, kernel_size=9, patch_size=7, has_batchnorm=True, batchnorm_momentum=0.1, use_batchnorm_track=True):
+    layers = []
+    layers += [
+        nn.Conv2d(in_channel, dim, kernel_size=patch_size, stride=patch_size), 
+        nn.GELU(), 
+    ]
+    if has_batchnorm:
+        layers += [nn.BatchNorm2d(dim, momentum=batchnorm_momentum, track_running_stats=use_batchnorm_track)]
+    for i in range(depth):
+        residual_layers = [
+            nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
+            nn.GELU(),
+        ]
+        if has_batchnorm:
+            residual_layers += [nn.BatchNorm2d(dim, momentum=batchnorm_momentum, track_running_stats=use_batchnorm_track)]
+        layers += [
+            Residual(nn.Sequential(*residual_layers)),
+            nn.Conv2d(dim, dim, kernel_size=1),
+            nn.GELU(),
+        ]
+        if has_batchnorm:
+            layers += [nn.BatchNorm2d(dim, momentum=batchnorm_momentum, track_running_stats=use_batchnorm_track)]
+    layers += [
+        nn.AdaptiveAvgPool2d((1,1)),
+        nn.Flatten(),
+        nn.Linear(dim, out_channel)
+    ]
+    return nn.Sequential(
+        *layers
+    )
+
+def ConvMixer_old(in_channel, out_channel, dim, depth, kernel_size=9, patch_size=7, has_batchnorm=True):
     return nn.Sequential(
         nn.Conv2d(in_channel, dim, kernel_size=patch_size, stride=patch_size),
         nn.GELU(),
